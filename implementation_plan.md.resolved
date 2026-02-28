@@ -1,0 +1,1363 @@
+# The Purple Pulse — Full Implementation Plan
+
+> **Target Agent:** OpenCode / Claude  
+> **Hackathon:** Monad Blitz 2026  
+> **Working Directory:** `c:\Users\DELL\OneDrive\Desktop\Monad Blitz 2026`  
+> **Goal:** Build a production-ready 16×16 decentralized musical sequencer that flexes Monad's Parallel EVM and 800ms finality.
+
+---
+
+## Phase 0 — Project Scaffolding
+
+### Step 0.1 — Initialize the monorepo
+
+```bash
+cd "c:\Users\DELL\OneDrive\Desktop\Monad Blitz 2026"
+npm init -y
+```
+
+Edit the generated `package.json`:
+- Set `"name": "the-purple-pulse"`
+- Set `"private": true`
+- Add `"workspaces": ["contracts", "frontend"]`
+
+### Step 0.2 — Scaffold the Hardhat sub-project
+
+```bash
+mkdir contracts && cd contracts
+npx -y hardhat@latest init
+```
+
+Choose **"Create a JavaScript project"** when prompted. Accept all defaults.
+
+Then install dependencies:
+
+```bash
+npm install @openzeppelin/contracts
+```
+
+### Step 0.3 — Scaffold the Next.js sub-project
+
+```bash
+cd "c:\Users\DELL\OneDrive\Desktop\Monad Blitz 2026"
+npx -y create-next-app@latest frontend --ts --tailwind --eslint --app --src-dir --no-import-alias --use-npm
+```
+
+Then install frontend dependencies:
+
+```bash
+cd frontend
+npm install viem wagmi @tanstack/react-query tone @rainbow-me/rainbowkit
+```
+
+### Step 0.4 — Final file tree target
+
+```
+the-purple-pulse/
+├── contracts/
+│   ├── contracts/
+│   │   └── PulseCore.sol
+│   ├── scripts/
+│   │   └── deploy.js
+│   ├── test/
+│   │   └── PulseCore.test.js
+│   └── hardhat.config.js
+├── frontend/
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── layout.tsx
+│   │   │   ├── page.tsx
+│   │   │   └── globals.css
+│   │   ├── components/
+│   │   │   ├── SequencerGrid.tsx
+│   │   │   ├── TilePad.tsx
+│   │   │   ├── Dashboard.tsx
+│   │   │   ├── TpsMeter.tsx
+│   │   │   ├── FinalityClock.tsx
+│   │   │   └── HypeMeter.tsx
+│   │   ├── hooks/
+│   │   │   ├── useMonadSync.ts
+│   │   │   └── useAudioEngine.ts
+│   │   ├── lib/
+│   │   │   ├── contract.ts       (ABI + address constants)
+│   │   │   ├── wagmiConfig.ts
+│   │   │   └── sounds.ts         (sample map)
+│   │   └── providers/
+│   │       └── Web3Provider.tsx
+│   ├── public/
+│   │   ├── samples/              (16 audio files)
+│   │   └── manifest.json         (PWA)
+│   └── next.config.ts
+└── package.json
+```
+
+---
+
+## Phase 1 — Smart Contract (`PulseCore.sol`)
+
+### Step 1.1 — Write `contracts/contracts/PulseCore.sol`
+
+**[NEW]** `PulseCore.sol`
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+contract PulseCore is ReentrancyGuard {
+    // ─── Types ────────────────────────────────────────────
+    struct Tile {
+        bool active;
+        address currentOwner;
+        uint256 lastToggled;
+    }
+
+    // ─── Constants ────────────────────────────────────────
+    uint256 public constant GRID_SIZE = 256;          // 16 × 16
+    uint256 public constant FREE_CREDITS = 10;
+
+    // ─── State (shard-per-tile for parallel execution) ───
+    mapping(uint256 => Tile) public tiles;
+    mapping(address => uint256) public credits;
+    uint256 public sequenceVersion;                    // bumps every block
+    uint256 public totalNotesStruck;
+
+    // ─── Events ───────────────────────────────────────────
+    event NoteStruck(
+        uint256 indexed tileId,
+        address indexed player,
+        uint256 timestamp,
+        bool active
+    );
+    event CreditsGranted(address indexed player, uint256 amount);
+
+    // ─── Constructor ──────────────────────────────────────
+    constructor() {
+        sequenceVersion = 1;
+    }
+
+    // ─── Public Functions ─────────────────────────────────
+
+    /// @notice Claim free credits (once per address)
+    function claimCredits() external {
+        require(credits[msg.sender] == 0, "Already claimed");
+        credits[msg.sender] = FREE_CREDITS;
+        emit CreditsGranted(msg.sender, FREE_CREDITS);
+    }
+
+    /// @notice Toggle a tile on/off — the core interaction
+    function toggleNote(uint256 tileId) external nonReentrant {
+        require(tileId < GRID_SIZE, "Invalid tile");
+        require(credits[msg.sender] > 0, "No credits");
+
+        Tile storage t = tiles[tileId];
+        t.active = !t.active;
+        t.currentOwner = msg.sender;
+        t.lastToggled = block.timestamp;
+
+        credits[msg.sender] -= 1;
+        totalNotesStruck += 1;
+
+        emit NoteStruck(tileId, msg.sender, block.timestamp, t.active);
+    }
+
+    /// @notice Returns all 256 tile states packed into a single uint256
+    ///         bit i == 1 means tiles[i].active == true
+    function getPackedGridState() external view returns (uint256 packed) {
+        for (uint256 i = 0; i < GRID_SIZE; i++) {
+            if (tiles[i].active) {
+                packed |= (1 << i);
+            }
+        }
+    }
+
+    /// @notice Bump the global sequence version (called by keeper / cron)
+    function heartbeat() external {
+        sequenceVersion += 1;
+    }
+}
+```
+
+**Key design decisions:**
+- Each `tiles[i]` lives in its own storage slot → Monad parallel EVM can process `toggleNote(5)` and `toggleNote(42)` simultaneously on different cores.
+- `getPackedGridState()` returns a single `uint256` bitmask → the frontend can sync the full grid in **one RPC call**.
+- `ReentrancyGuard` on `toggleNote` for safety, minimal gas overhead.
+
+### Step 1.2 — Write tests `contracts/test/PulseCore.test.js`
+
+**[NEW]** `PulseCore.test.js`
+
+```javascript
+const { expect } = require("chai");
+const { ethers } = require("hardhat");
+
+describe("PulseCore", function () {
+  let pulse, owner, player1, player2;
+
+  beforeEach(async () => {
+    [owner, player1, player2] = await ethers.getSigners();
+    const PulseCore = await ethers.getContractFactory("PulseCore");
+    pulse = await PulseCore.deploy();
+  });
+
+  it("should grant 10 free credits", async () => {
+    await pulse.connect(player1).claimCredits();
+    expect(await pulse.credits(player1.address)).to.equal(10);
+  });
+
+  it("should prevent double-claiming credits", async () => {
+    await pulse.connect(player1).claimCredits();
+    await expect(pulse.connect(player1).claimCredits()).to.be.revertedWith("Already claimed");
+  });
+
+  it("should toggle a tile on", async () => {
+    await pulse.connect(player1).claimCredits();
+    await pulse.connect(player1).toggleNote(0);
+    const tile = await pulse.tiles(0);
+    expect(tile.active).to.be.true;
+    expect(tile.currentOwner).to.equal(player1.address);
+  });
+
+  it("should toggle a tile off on second call", async () => {
+    await pulse.connect(player1).claimCredits();
+    await pulse.connect(player1).toggleNote(0);
+    await pulse.connect(player1).toggleNote(0);
+    const tile = await pulse.tiles(0);
+    expect(tile.active).to.be.false;
+  });
+
+  it("should emit NoteStruck event", async () => {
+    await pulse.connect(player1).claimCredits();
+    await expect(pulse.connect(player1).toggleNote(5))
+      .to.emit(pulse, "NoteStruck")
+      .withArgs(5, player1.address, (v) => true, true);
+  });
+
+  it("should reject invalid tile id", async () => {
+    await pulse.connect(player1).claimCredits();
+    await expect(pulse.connect(player1).toggleNote(256)).to.be.revertedWith("Invalid tile");
+  });
+
+  it("should reject when no credits", async () => {
+    await expect(pulse.connect(player1).toggleNote(0)).to.be.revertedWith("No credits");
+  });
+
+  it("should return correct packed grid state", async () => {
+    await pulse.connect(player1).claimCredits();
+    await pulse.connect(player1).toggleNote(0);
+    await pulse.connect(player1).toggleNote(3);
+    const packed = await pulse.getPackedGridState();
+    // bits 0 and 3 should be set → 0b1001 = 9
+    expect(packed).to.equal(9n);
+  });
+
+  it("should support parallel-safe operations on different tiles", async () => {
+    await pulse.connect(player1).claimCredits();
+    await pulse.connect(player2).claimCredits();
+    // Simulate "parallel" by sending both txns
+    await Promise.all([
+      pulse.connect(player1).toggleNote(10),
+      pulse.connect(player2).toggleNote(20),
+    ]);
+    expect((await pulse.tiles(10)).active).to.be.true;
+    expect((await pulse.tiles(20)).active).to.be.true;
+  });
+});
+```
+
+### Step 1.3 — Deploy script `contracts/scripts/deploy.js`
+
+**[NEW]** `deploy.js`
+
+```javascript
+const hre = require("hardhat");
+
+async function main() {
+  const PulseCore = await hre.ethers.getContractFactory("PulseCore");
+  const pulse = await PulseCore.deploy();
+  await pulse.waitForDeployment();
+  const address = await pulse.getAddress();
+  console.log(`PulseCore deployed to: ${address}`);
+
+  // Write the address to a file the frontend can import
+  const fs = require("fs");
+  const path = require("path");
+  const output = { address, network: hre.network.name };
+  const outPath = path.join(__dirname, "../../frontend/src/lib/deployedAddress.json");
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, JSON.stringify(output, null, 2));
+  console.log(`Address written to ${outPath}`);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+### Step 1.4 — Configure Hardhat for Monad Testnet
+
+**[MODIFY]** `contracts/hardhat.config.js`
+
+```javascript
+require("@nomicfoundation/hardhat-toolbox");
+
+/** @type import('hardhat/config').HardhatUserConfig */
+module.exports = {
+  solidity: "0.8.24",
+  networks: {
+    monadTestnet: {
+      url: "https://testnet-rpc.monad.xyz",
+      chainId: 10143,
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+    },
+    localhost: {
+      url: "http://127.0.0.1:8545",
+    },
+  },
+};
+```
+
+---
+
+## Phase 2 — Frontend Foundation
+
+### Step 2.1 — Global styles (`globals.css`)
+
+**[MODIFY]** `frontend/src/app/globals.css`
+
+Replace the entire file with the **Cyber-Purple** design system:
+
+```css
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
+
+:root {
+  /* ── Purple Palette ─────────────────────── */
+  --purple-100: #EDE9FE;
+  --purple-200: #C4B5FD;
+  --purple-300: #A78BFA;
+  --purple-400: #836EF9;
+  --purple-500: #7C3AED;
+  --purple-600: #6D28D9;
+  --purple-700: #5B21B6;
+  --purple-900: #1E0A3C;
+
+  /* ── Functional ─────────────────────────── */
+  --bg-primary: #0A0118;
+  --bg-card: rgba(131, 110, 249, 0.06);
+  --bg-glass: rgba(131, 110, 249, 0.08);
+  --border-glass: rgba(131, 110, 249, 0.18);
+  --text-primary: #F5F3FF;
+  --text-secondary: #A78BFA;
+  --text-muted: rgba(167, 139, 250, 0.5);
+  --glow-purple: 0 0 20px rgba(131, 110, 249, 0.4);
+  --glow-hot: 0 0 30px rgba(131, 110, 249, 0.8);
+
+  /* ── Timing ─────────────────────────────── */
+  --transition-fast: 120ms ease;
+  --transition-med: 250ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Outfit', sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+  overflow-x: hidden;
+  background-image:
+    radial-gradient(ellipse at 20% 50%, rgba(131,110,249,0.08) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 50%, rgba(93,63,211,0.06) 0%, transparent 50%);
+}
+
+/* ── Glassmorphism Card ──────────────────── */
+.glass {
+  background: var(--bg-glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-glass);
+  border-radius: 16px;
+}
+
+/* ── Glow Keyframes ──────────────────────── */
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 8px rgba(131,110,249,0.3); }
+  50%      { box-shadow: 0 0 24px rgba(131,110,249,0.7); }
+}
+@keyframes ripple {
+  0%   { transform: scale(1); opacity: 0.6; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+@keyframes finality-ring {
+  0%   { stroke-dashoffset: 283; }
+  100% { stroke-dashoffset: 0; }
+}
+
+/* ── Scrollbar ───────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--purple-600); border-radius: 3px; }
+
+/* ── Utility ─────────────────────────────── */
+.mono { font-family: 'JetBrains Mono', monospace; }
+```
+
+### Step 2.2 — Wagmi + RainbowKit config
+
+**[NEW]** `frontend/src/lib/wagmiConfig.ts`
+
+```typescript
+import { http, createConfig } from "wagmi";
+import { defineChain } from "viem";
+import { getDefaultConfig } from "@rainbow-me/rainbowkit";
+
+export const monadTestnet = defineChain({
+  id: 10143,
+  name: "Monad Testnet",
+  nativeCurrency: { name: "MON", symbol: "MON", decimals: 18 },
+  rpcUrls: {
+    default: {
+      http: ["https://testnet-rpc.monad.xyz"],
+      webSocket: ["wss://testnet-rpc.monad.xyz"],
+    },
+  },
+  blockExplorers: {
+    default: { name: "Monad Explorer", url: "https://testnet.monadexplorer.com" },
+  },
+  testnet: true,
+});
+
+export const config = getDefaultConfig({
+  appName: "The Purple Pulse",
+  projectId: process.env.NEXT_PUBLIC_WC_PROJECT_ID || "YOUR_WALLETCONNECT_PROJECT_ID",
+  chains: [monadTestnet],
+  transports: {
+    [monadTestnet.id]: http("https://testnet-rpc.monad.xyz"),
+  },
+  ssr: true,
+});
+```
+
+### Step 2.3 — Contract ABI + Address constants
+
+**[NEW]** `frontend/src/lib/contract.ts`
+
+```typescript
+export const PULSE_CORE_ADDRESS = "0x_DEPLOY_ADDRESS_HERE" as `0x${string}`;
+
+export const PULSE_CORE_ABI = [
+  {
+    type: "function",
+    name: "toggleNote",
+    inputs: [{ name: "tileId", type: "uint256" }],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "claimCredits",
+    inputs: [],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "getPackedGridState",
+    inputs: [],
+    outputs: [{ name: "packed", type: "uint256" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "credits",
+    inputs: [{ name: "", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "totalNotesStruck",
+    inputs: [],
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "sequenceVersion",
+    inputs: [],
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+  },
+  {
+    type: "event",
+    name: "NoteStruck",
+    inputs: [
+      { name: "tileId", type: "uint256", indexed: true },
+      { name: "player", type: "address", indexed: true },
+      { name: "timestamp", type: "uint256", indexed: false },
+      { name: "active", type: "bool", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "CreditsGranted",
+    inputs: [
+      { name: "player", type: "address", indexed: true },
+      { name: "amount", type: "uint256", indexed: false },
+    ],
+  },
+] as const;
+```
+
+### Step 2.4 — Web3 Provider
+
+**[NEW]** `frontend/src/providers/Web3Provider.tsx`
+
+```tsx
+"use client";
+
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { WagmiProvider } from "wagmi";
+import { RainbowKitProvider, darkTheme } from "@rainbow-me/rainbowkit";
+import { config } from "@/lib/wagmiConfig";
+import "@rainbow-me/rainbowkit/styles.css";
+
+const queryClient = new QueryClient();
+
+export default function Web3Provider({ children }: { children: React.ReactNode }) {
+  return (
+    <WagmiProvider config={config}>
+      <QueryClientProvider client={queryClient}>
+        <RainbowKitProvider
+          theme={darkTheme({
+            accentColor: "#836EF9",
+            accentColorForeground: "white",
+            borderRadius: "medium",
+          })}
+        >
+          {children}
+        </RainbowKitProvider>
+      </QueryClientProvider>
+    </WagmiProvider>
+  );
+}
+```
+
+### Step 2.5 — Sound sample map
+
+**[NEW]** `frontend/src/lib/sounds.ts`
+
+```typescript
+// Each row (0-15) maps to an instrument sample.
+// We use Tone.js built-in synths for the hackathon demo;
+// replace with real .wav samples in /public/samples/ for production.
+
+export const ROW_INSTRUMENTS: { name: string; type: "synth" | "noise" | "membrane" | "metal"; note: string }[] = [
+  { name: "Sub Kick",       type: "membrane", note: "C1"  },
+  { name: "808 Kick",       type: "membrane", note: "D1"  },
+  { name: "Snare",          type: "noise",    note: "C3"  },
+  { name: "Clap",           type: "noise",    note: "D3"  },
+  { name: "Closed HH",      type: "metal",    note: "F#3" },
+  { name: "Open HH",        type: "metal",    note: "A#3" },
+  { name: "Ride",           type: "metal",    note: "C#4" },
+  { name: "Crash",          type: "metal",    note: "A4"  },
+  { name: "Tom Low",        type: "membrane", note: "G2"  },
+  { name: "Tom Mid",        type: "membrane", note: "B2"  },
+  { name: "Tom Hi",         type: "membrane", note: "D3"  },
+  { name: "Neon Synth 1",   type: "synth",    note: "C4"  },
+  { name: "Neon Synth 2",   type: "synth",    note: "E4"  },
+  { name: "Neon Synth 3",   type: "synth",    note: "G4"  },
+  { name: "Glitch Perc",    type: "noise",    note: "A5"  },
+  { name: "FX Stab",        type: "synth",    note: "C5"  },
+];
+```
+
+---
+
+## Phase 3 — Core Hooks
+
+### Step 3.1 — `useAudioEngine` hook
+
+**[NEW]** `frontend/src/hooks/useAudioEngine.ts`
+
+```typescript
+"use client";
+
+import { useCallback, useRef, useEffect } from "react";
+import * as Tone from "tone";
+import { ROW_INSTRUMENTS } from "@/lib/sounds";
+
+export function useAudioEngine() {
+  const synths = useRef<(Tone.Synth | Tone.NoiseSynth | Tone.MembraneSynth | Tone.MetalSynth)[]>([]);
+  const isReady = useRef(false);
+
+  const init = useCallback(async () => {
+    if (isReady.current) return;
+    await Tone.start();
+
+    // Set master BPM to 120 → 1/16 note = 125ms ≈ Monad block time
+    Tone.getTransport().bpm.value = 120;
+
+    synths.current = ROW_INSTRUMENTS.map((inst) => {
+      switch (inst.type) {
+        case "membrane":
+          return new Tone.MembraneSynth({ volume: -8 }).toDestination();
+        case "metal":
+          return new Tone.MetalSynth({ volume: -12 }).toDestination();
+        case "noise":
+          return new Tone.NoiseSynth({ volume: -10 }).toDestination();
+        case "synth":
+        default:
+          return new Tone.Synth({
+            oscillator: { type: "triangle" },
+            envelope: { attack: 0.01, decay: 0.2, sustain: 0.1, release: 0.3 },
+            volume: -8,
+          }).toDestination();
+      }
+    });
+
+    Tone.getTransport().start();
+    isReady.current = true;
+  }, []);
+
+  // Strike a note by row index — schedules on the next 16th note subdivision
+  const strikeNote = useCallback((row: number) => {
+    if (!isReady.current || row < 0 || row >= 16) return;
+    const synth = synths.current[row];
+    const inst = ROW_INSTRUMENTS[row];
+
+    // Schedule for the very next 16th note quantization
+    const time = Tone.getTransport().nextSubdivision("16n");
+
+    if (synth instanceof Tone.NoiseSynth) {
+      synth.triggerAttackRelease("16n", time);
+    } else if (synth instanceof Tone.MetalSynth) {
+      synth.triggerAttackRelease("16n", time);
+    } else {
+      (synth as Tone.Synth | Tone.MembraneSynth).triggerAttackRelease(inst.note, "16n", time);
+    }
+  }, []);
+
+  // Cleanup
+  useEffect(() => {
+    return () => {
+      synths.current.forEach((s) => s.dispose());
+      Tone.getTransport().stop();
+    };
+  }, []);
+
+  return { init, strikeNote };
+}
+```
+
+### Step 3.2 — `useMonadSync` hook
+
+**[NEW]** `frontend/src/hooks/useMonadSync.ts`
+
+```typescript
+"use client";
+
+import { useEffect, useRef, useCallback, useState } from "react";
+import { createPublicClient, webSocket, http, parseAbiItem, type Log } from "viem";
+import { monadTestnet } from "@/lib/wagmiConfig";
+import { PULSE_CORE_ADDRESS, PULSE_CORE_ABI } from "@/lib/contract";
+
+export interface NoteStrikeEvent {
+  tileId: number;
+  player: `0x${string}`;
+  timestamp: bigint;
+  active: boolean;
+}
+
+export function useMonadSync(onNoteStrike: (e: NoteStrikeEvent) => void) {
+  const [tps, setTps] = useState(0);
+  const [blockNumber, setBlockNumber] = useState<bigint>(0n);
+  const [lastBlockTime, setLastBlockTime] = useState<number>(Date.now());
+  const [finalityMs, setFinalityMs] = useState(800);
+  const eventTimestamps = useRef<number[]>([]);
+
+  // Calculate rolling TPS (events in last 5 seconds)
+  const updateTps = useCallback(() => {
+    const now = Date.now();
+    eventTimestamps.current = eventTimestamps.current.filter((t) => now - t < 5000);
+    setTps(Math.round(eventTimestamps.current.length / 5));
+  }, []);
+
+  useEffect(() => {
+    // Try WebSocket first, fall back to HTTP polling
+    let client: ReturnType<typeof createPublicClient>;
+    try {
+      client = createPublicClient({
+        chain: monadTestnet,
+        transport: webSocket("wss://testnet-rpc.monad.xyz"),
+      });
+    } catch {
+      client = createPublicClient({
+        chain: monadTestnet,
+        transport: http("https://testnet-rpc.monad.xyz"),
+      });
+    }
+
+    // Watch for NoteStruck events
+    const unwatch = client.watchContractEvent({
+      address: PULSE_CORE_ADDRESS,
+      abi: PULSE_CORE_ABI,
+      eventName: "NoteStruck",
+      onLogs: (logs) => {
+        const now = Date.now();
+        for (const log of logs) {
+          const args = (log as any).args;
+          if (!args) continue;
+          eventTimestamps.current.push(now);
+          onNoteStrike({
+            tileId: Number(args.tileId),
+            player: args.player,
+            timestamp: args.timestamp,
+            active: args.active,
+          });
+        }
+        updateTps();
+      },
+    });
+
+    // Watch blocks for finality tracking
+    const unwatchBlocks = client.watchBlockNumber({
+      onBlockNumber: (bn) => {
+        const now = Date.now();
+        setFinalityMs(now - lastBlockTime);
+        setLastBlockTime(now);
+        setBlockNumber(bn);
+      },
+    });
+
+    // TPS update interval
+    const tpsInterval = setInterval(updateTps, 1000);
+
+    return () => {
+      unwatch();
+      unwatchBlocks();
+      clearInterval(tpsInterval);
+    };
+  }, [onNoteStrike, updateTps]);
+
+  return { tps, blockNumber, finalityMs };
+}
+```
+
+---
+
+## Phase 4 — UI Components
+
+### Step 4.1 — `TilePad.tsx`
+
+**[NEW]** `frontend/src/components/TilePad.tsx`
+
+```tsx
+"use client";
+
+import { useState, useCallback } from "react";
+
+interface TilePadProps {
+  tileId: number;
+  active: boolean;
+  heatLevel: number;        // 0-1, controls glow intensity
+  optimistic: boolean;      // true while waiting for chain confirmation
+  onToggle: (id: number) => void;
+}
+
+export default function TilePad({ tileId, active, heatLevel, optimistic, onToggle }: TilePadProps) {
+  const [ripple, setRipple] = useState(false);
+
+  const handleClick = useCallback(() => {
+    setRipple(true);
+    onToggle(tileId);
+    setTimeout(() => setRipple(false), 400);
+  }, [tileId, onToggle]);
+
+  const glowIntensity = active ? 0.4 + heatLevel * 0.6 : 0;
+  const borderColor = optimistic
+    ? "rgba(255, 200, 50, 0.8)"
+    : active
+    ? `rgba(131, 110, 249, ${0.5 + heatLevel * 0.5})`
+    : "rgba(131, 110, 249, 0.12)";
+
+  return (
+    <button
+      onClick={handleClick}
+      style={{
+        position: "relative",
+        width: "100%",
+        aspectRatio: "1",
+        background: active
+          ? `rgba(131, 110, 249, ${0.15 + heatLevel * 0.35})`
+          : "rgba(131, 110, 249, 0.04)",
+        border: `1.5px solid ${borderColor}`,
+        borderRadius: "8px",
+        cursor: "pointer",
+        transition: "all 150ms ease",
+        boxShadow: active
+          ? `0 0 ${12 + heatLevel * 20}px rgba(131, 110, 249, ${glowIntensity})`
+          : "none",
+        overflow: "hidden",
+      }}
+    >
+      {ripple && (
+        <span
+          style={{
+            position: "absolute",
+            inset: 0,
+            borderRadius: "8px",
+            border: "2px solid rgba(131, 110, 249, 0.6)",
+            animation: "ripple 0.4s ease-out forwards",
+            pointerEvents: "none",
+          }}
+        />
+      )}
+    </button>
+  );
+}
+```
+
+### Step 4.2 — `SequencerGrid.tsx`
+
+**[NEW]** `frontend/src/components/SequencerGrid.tsx`
+
+```tsx
+"use client";
+
+import { useState, useCallback, useRef, useEffect } from "react";
+import { useWriteContract, useReadContract, useAccount } from "wagmi";
+import TilePad from "./TilePad";
+import { PULSE_CORE_ADDRESS, PULSE_CORE_ABI } from "@/lib/contract";
+import { useMonadSync, type NoteStrikeEvent } from "@/hooks/useMonadSync";
+import { useAudioEngine } from "@/hooks/useAudioEngine";
+
+interface TileState {
+  active: boolean;
+  heatLevel: number;
+  optimistic: boolean;
+}
+
+export default function SequencerGrid() {
+  const { address } = useAccount();
+  const { writeContract } = useWriteContract();
+  const { init: initAudio, strikeNote } = useAudioEngine();
+  const [audioStarted, setAudioStarted] = useState(false);
+
+  // 256 tiles
+  const [grid, setGrid] = useState<TileState[]>(
+    Array.from({ length: 256 }, () => ({ active: false, heatLevel: 0, optimistic: false }))
+  );
+
+  // Heat decay timer
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setGrid((prev) =>
+        prev.map((t) => ({
+          ...t,
+          heatLevel: Math.max(0, t.heatLevel - 0.02),
+        }))
+      );
+    }, 200);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Handle incoming NoteStruck events
+  const handleNoteStrike = useCallback(
+    (e: NoteStrikeEvent) => {
+      const row = Math.floor(e.tileId / 16);
+      strikeNote(row);
+
+      setGrid((prev) => {
+        const next = [...prev];
+        next[e.tileId] = {
+          active: e.active,
+          heatLevel: Math.min(1, (next[e.tileId]?.heatLevel || 0) + 0.3),
+          optimistic: false,
+        };
+        return next;
+      });
+    },
+    [strikeNote]
+  );
+
+  const { tps, blockNumber, finalityMs } = useMonadSync(handleNoteStrike);
+
+  // Sync initial grid state
+  const { data: packedState } = useReadContract({
+    address: PULSE_CORE_ADDRESS,
+    abi: PULSE_CORE_ABI,
+    functionName: "getPackedGridState",
+  });
+
+  useEffect(() => {
+    if (packedState === undefined) return;
+    const packed = BigInt(packedState);
+    setGrid((prev) =>
+      prev.map((t, i) => ({
+        ...t,
+        active: (packed & (1n << BigInt(i))) !== 0n,
+      }))
+    );
+  }, [packedState]);
+
+  // Handle user toggle
+  const handleToggle = useCallback(
+    async (tileId: number) => {
+      if (!audioStarted) {
+        await initAudio();
+        setAudioStarted(true);
+      }
+
+      // Optimistic update
+      setGrid((prev) => {
+        const next = [...prev];
+        next[tileId] = { ...next[tileId], active: !next[tileId].active, optimistic: true };
+        return next;
+      });
+
+      // Play sound immediately (optimistic audio)
+      const row = Math.floor(tileId / 16);
+      strikeNote(row);
+
+      // Send TX
+      writeContract({
+        address: PULSE_CORE_ADDRESS,
+        abi: PULSE_CORE_ABI,
+        functionName: "toggleNote",
+        args: [BigInt(tileId)],
+      });
+    },
+    [audioStarted, initAudio, strikeNote, writeContract]
+  );
+
+  return (
+    <div>
+      {/* Stats bar */}
+      <div style={{ display: "flex", gap: "24px", marginBottom: "16px", fontFamily: "'JetBrains Mono', monospace", fontSize: "13px" }}>
+        <span style={{ color: "#A78BFA" }}>
+          TPS: <strong style={{ color: "#836EF9" }}>{tps}</strong>
+        </span>
+        <span style={{ color: "#A78BFA" }}>
+          Block: <strong style={{ color: "#836EF9" }}>#{blockNumber.toString()}</strong>
+        </span>
+        <span style={{ color: "#A78BFA" }}>
+          Finality: <strong style={{ color: "#836EF9" }}>{finalityMs}ms</strong>
+        </span>
+      </div>
+
+      {/* 16×16 Grid */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(16, 1fr)",
+          gap: "4px",
+          maxWidth: "640px",
+        }}
+      >
+        {grid.map((tile, i) => (
+          <TilePad
+            key={i}
+            tileId={i}
+            active={tile.active}
+            heatLevel={tile.heatLevel}
+            optimistic={tile.optimistic}
+            onToggle={handleToggle}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+### Step 4.3 — `Dashboard.tsx` (TPS + Finality sidebar)
+
+**[NEW]** `frontend/src/components/Dashboard.tsx`
+
+```tsx
+"use client";
+
+import TpsMeter from "./TpsMeter";
+import FinalityClock from "./FinalityClock";
+import HypeMeter from "./HypeMeter";
+
+interface DashboardProps {
+  tps: number;
+  finalityMs: number;
+  totalNotes: number;
+}
+
+export default function Dashboard({ tps, finalityMs, totalNotes }: DashboardProps) {
+  return (
+    <aside
+      className="glass"
+      style={{
+        padding: "24px",
+        display: "flex",
+        flexDirection: "column",
+        gap: "24px",
+        minWidth: "260px",
+      }}
+    >
+      <h2 style={{ fontSize: "16px", fontWeight: 700, color: "#836EF9", letterSpacing: "0.05em", textTransform: "uppercase" }}>
+        X-Ray Dashboard
+      </h2>
+      <TpsMeter tps={tps} />
+      <FinalityClock finalityMs={finalityMs} />
+      <HypeMeter totalNotes={totalNotes} />
+    </aside>
+  );
+}
+```
+
+### Step 4.4 — `TpsMeter.tsx`
+
+**[NEW]** `frontend/src/components/TpsMeter.tsx`
+
+```tsx
+"use client";
+
+export default function TpsMeter({ tps }: { tps: number }) {
+  const maxTps = 200;
+  const pct = Math.min(100, (tps / maxTps) * 100);
+  const color = tps > 100 ? "#F472B6" : tps > 50 ? "#C084FC" : "#836EF9";
+
+  return (
+    <div>
+      <div style={{ fontSize: "12px", color: "#A78BFA", marginBottom: "8px", textTransform: "uppercase", letterSpacing: "0.1em" }}>
+        Performance TPS
+      </div>
+      <div className="mono" style={{ fontSize: "32px", fontWeight: 700, color }}>
+        {tps}
+      </div>
+      <div style={{ height: "6px", borderRadius: "3px", background: "rgba(131,110,249,0.15)", marginTop: "8px", overflow: "hidden" }}>
+        <div
+          style={{
+            height: "100%",
+            width: `${pct}%`,
+            background: `linear-gradient(90deg, #836EF9, ${color})`,
+            borderRadius: "3px",
+            transition: "width 300ms ease",
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+```
+
+### Step 4.5 — `FinalityClock.tsx`
+
+**[NEW]** `frontend/src/components/FinalityClock.tsx`
+
+```tsx
+"use client";
+
+import { useEffect, useState } from "react";
+
+export default function FinalityClock({ finalityMs }: { finalityMs: number }) {
+  const [progress, setProgress] = useState(0);
+
+  useEffect(() => {
+    setProgress(0);
+    const start = Date.now();
+    const interval = setInterval(() => {
+      const elapsed = Date.now() - start;
+      setProgress(Math.min(1, elapsed / 800));
+    }, 50);
+    return () => clearInterval(interval);
+  }, [finalityMs]); // Resets when a new block arrives
+
+  const circumference = 2 * Math.PI * 45;
+  const offset = circumference * (1 - progress);
+
+  return (
+    <div style={{ textAlign: "center" }}>
+      <div style={{ fontSize: "12px", color: "#A78BFA", marginBottom: "8px", textTransform: "uppercase", letterSpacing: "0.1em" }}>
+        Finality Clock
+      </div>
+      <svg width="100" height="100" viewBox="0 0 100 100">
+        <circle cx="50" cy="50" r="45" fill="none" stroke="rgba(131,110,249,0.12)" strokeWidth="4" />
+        <circle
+          cx="50" cy="50" r="45"
+          fill="none"
+          stroke="#836EF9"
+          strokeWidth="4"
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+          transform="rotate(-90 50 50)"
+          style={{ transition: "stroke-dashoffset 50ms linear" }}
+        />
+        <text x="50" y="54" textAnchor="middle" fill="#F5F3FF" fontSize="16" fontFamily="'JetBrains Mono', monospace">
+          {finalityMs}ms
+        </text>
+      </svg>
+    </div>
+  );
+}
+```
+
+### Step 4.6 — `HypeMeter.tsx`
+
+**[NEW]** `frontend/src/components/HypeMeter.tsx`
+
+```tsx
+"use client";
+
+export default function HypeMeter({ totalNotes }: { totalNotes: number }) {
+  const levels = [
+    { label: "🔥 MELTDOWN", threshold: 5000 },
+    { label: "⚡ ELECTRIC", threshold: 2000 },
+    { label: "🎵 VIBING", threshold: 500 },
+    { label: "💤 WARMING UP", threshold: 0 },
+  ];
+  const current = levels.find((l) => totalNotes >= l.threshold) || levels[levels.length - 1];
+  const pct = Math.min(100, (totalNotes / 5000) * 100);
+
+  return (
+    <div>
+      <div style={{ fontSize: "12px", color: "#A78BFA", marginBottom: "8px", textTransform: "uppercase", letterSpacing: "0.1em" }}>
+        Hype Meter
+      </div>
+      <div style={{ fontSize: "20px", fontWeight: 700, color: "#F5F3FF" }}>{current.label}</div>
+      <div className="mono" style={{ fontSize: "14px", color: "#A78BFA", margin: "4px 0" }}>
+        {totalNotes.toLocaleString()} notes struck
+      </div>
+      <div style={{ height: "8px", borderRadius: "4px", background: "rgba(131,110,249,0.15)", overflow: "hidden" }}>
+        <div
+          style={{
+            height: "100%",
+            width: `${pct}%`,
+            background: "linear-gradient(90deg, #836EF9, #F472B6, #FCD34D)",
+            borderRadius: "4px",
+            transition: "width 500ms ease",
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+## Phase 5 — Main Page Assembly
+
+### Step 5.1 — Root layout
+
+**[MODIFY]** `frontend/src/app/layout.tsx`
+
+```tsx
+import type { Metadata } from "next";
+import Web3Provider from "@/providers/Web3Provider";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "The Purple Pulse — Monad Decentralized Sequencer",
+  description: "A 16×16 collaborative musical sequencer powered by Monad's Parallel EVM. 800ms finality, infinite creativity.",
+  keywords: ["Monad", "Blockchain", "Music", "Sequencer", "Web3", "Hackathon"],
+};
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body>
+        <Web3Provider>{children}</Web3Provider>
+      </body>
+    </html>
+  );
+}
+```
+
+### Step 5.2 — Home page
+
+**[MODIFY]** `frontend/src/app/page.tsx`
+
+```tsx
+"use client";
+
+import { useState } from "react";
+import { ConnectButton } from "@rainbow-me/rainbowkit";
+import { useWriteContract, useReadContract, useAccount } from "wagmi";
+import SequencerGrid from "@/components/SequencerGrid";
+import Dashboard from "@/components/Dashboard";
+import { PULSE_CORE_ADDRESS, PULSE_CORE_ABI } from "@/lib/contract";
+
+export default function Home() {
+  const { address, isConnected } = useAccount();
+  const { writeContract } = useWriteContract();
+  const [tps, setTps] = useState(0);
+  const [finalityMs, setFinalityMs] = useState(800);
+
+  const { data: userCredits } = useReadContract({
+    address: PULSE_CORE_ADDRESS,
+    abi: PULSE_CORE_ABI,
+    functionName: "credits",
+    args: address ? [address] : undefined,
+  });
+
+  const { data: totalNotes } = useReadContract({
+    address: PULSE_CORE_ADDRESS,
+    abi: PULSE_CORE_ABI,
+    functionName: "totalNotesStruck",
+  });
+
+  const claimCredits = () => {
+    writeContract({
+      address: PULSE_CORE_ADDRESS,
+      abi: PULSE_CORE_ABI,
+      functionName: "claimCredits",
+    });
+  };
+
+  return (
+    <main style={{ minHeight: "100vh", padding: "24px 32px" }}>
+      {/* ── Header ─────────────────────────────── */}
+      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "32px" }}>
+        <div>
+          <h1 style={{ fontSize: "28px", fontWeight: 800, background: "linear-gradient(135deg, #836EF9, #C084FC)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+            The Purple Pulse
+          </h1>
+          <p style={{ fontSize: "13px", color: "#A78BFA", marginTop: "4px" }}>
+            Collaborative Decentralized Sequencer · Monad Blitz 2026
+          </p>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          {isConnected && (
+            <div className="mono" style={{ fontSize: "12px", color: "#A78BFA" }}>
+              Credits: <strong style={{ color: "#836EF9" }}>{userCredits?.toString() || "0"}</strong>
+              {Number(userCredits) === 0 && (
+                <button
+                  onClick={claimCredits}
+                  style={{
+                    marginLeft: "12px",
+                    padding: "6px 14px",
+                    background: "linear-gradient(135deg, #836EF9, #6D28D9)",
+                    border: "none",
+                    borderRadius: "8px",
+                    color: "white",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  Claim 10 Free
+                </button>
+              )}
+            </div>
+          )}
+          <ConnectButton />
+        </div>
+      </header>
+
+      {/* ── Body: Grid + Dashboard ─────────────── */}
+      <div style={{ display: "flex", gap: "32px", alignItems: "flex-start" }}>
+        <div style={{ flex: 1 }}>
+          <div className="glass" style={{ padding: "24px" }}>
+            <SequencerGrid />
+          </div>
+        </div>
+        <Dashboard tps={tps} finalityMs={finalityMs} totalNotes={Number(totalNotes || 0)} />
+      </div>
+
+      {/* ── Footer ─────────────────────────────── */}
+      <footer style={{ marginTop: "48px", textAlign: "center", fontSize: "12px", color: "rgba(167,139,250,0.4)" }}>
+        Built for Monad Blitz 2026 · Parallel EVM · 800ms Heartbeat
+      </footer>
+    </main>
+  );
+}
+```
+
+---
+
+## Phase 6 — PWA Manifest + QR
+
+### Step 6.1 — PWA Manifest
+
+**[NEW]** `frontend/public/manifest.json`
+
+```json
+{
+  "name": "The Purple Pulse",
+  "short_name": "PurplePulse",
+  "description": "Decentralized Musical Sequencer on Monad",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0A0118",
+  "theme_color": "#836EF9",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
+```
+
+### Step 6.2 — Add PWA meta tags to layout
+
+Add `<link rel="manifest" href="/manifest.json" />` and theme-color meta tag to `layout.tsx`'s `<head>`.
+
+---
+
+## Phase 7 — Deployment & Verification
+
+### Step 7.1 — Smart Contract Tests
+
+```bash
+cd contracts
+npx hardhat test
+```
+
+All 9 tests must pass (credits, toggle, events, packed state, parallel safety).
+
+### Step 7.2 — Deploy to Monad Testnet
+
+```bash
+cd contracts
+PRIVATE_KEY=<your-key> npx hardhat run scripts/deploy.js --network monadTestnet
+```
+
+Copy the deployed address into `frontend/src/lib/contract.ts` → `PULSE_CORE_ADDRESS`.
+
+### Step 7.3 — Run Frontend Locally
+
+```bash
+cd frontend
+npm run dev
+```
+
+- Open `http://localhost:3000` in two tabs
+- Connect wallet in both
+- Claim credits
+- Click tiles — verify audio plays immediately (optimistic)
+- Verify the second tab receives the event and plays the sound
+
+### Step 7.4 — Multi-Tab Parallel Test
+
+Open 3+ tabs, click different tiles rapidly. Confirm:
+- All tabs stay in sync
+- TPS meter updates
+- Finality clock resets each block
+- No "transaction pending" lag
+
+---
+
+## Execution Checklist (for OpenCode)
+
+> [!IMPORTANT]
+> Execute these phases in order. Each step produces files that later steps depend on.
+
+| # | Phase | Key Output |
+|---|-------|-----------|
+| 0 | Scaffolding | Monorepo with Hardhat + Next.js |
+| 1 | Smart Contract | `PulseCore.sol`, tests, deploy script |
+| 2 | Frontend Foundation | CSS design system, Wagmi config, providers |
+| 3 | Core Hooks | `useAudioEngine`, `useMonadSync` |
+| 4 | UI Components | Grid, TilePad, Dashboard widgets |
+| 5 | Page Assembly | `layout.tsx`, `page.tsx` |
+| 6 | PWA | `manifest.json`, meta tags |
+| 7 | Deploy & Verify | Contract tests, Monad deploy, multi-tab test |
